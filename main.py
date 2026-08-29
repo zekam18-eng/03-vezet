@@ -3,6 +3,7 @@ import sys
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
+    QTabWidget,
     QWidget,
     QLabel,
     QPushButton,
@@ -480,6 +481,225 @@ class EmergencyCardTab(QWidget):
         self.open_editable_note(document)
 
 
+class ReanimationTab(QWidget):
+    """Вкладка «Реанимация»: список случаев сердечно-лёгочной реанимации.
+    У каждого случая — клиническая картина (те же 13 разделов, что и в
+    обычной карте СМП) плюс отдельный блок с данными протокола СЛР
+    (реанимация до СМП, проходимость ВДП, ИВЛ, сосудистый доступ,
+    хронометраж, ЭКГ-мониторинг и дефибрилляция, медикаменты, итог)."""
+
+    def __init__(self):
+        super().__init__()
+
+        self.current_case_id = None
+        self.current_case_name = None
+        self.current_mkb_code = None
+
+        self.cases = []
+        self.field_edits = {}
+
+        self.init_ui()
+        self.load_cases()
+
+    def init_ui(self):
+
+        # ================= Колонка "Случаи" =================
+
+        self.case_search = QLineEdit()
+        self.case_search.setPlaceholderText("Поиск случая...")
+        self.case_search.textChanged.connect(self.filter_cases)
+
+        self.case_list = QListWidget()
+        self.case_list.itemDoubleClicked.connect(self.open_case)
+
+        self.open_case_button = QPushButton("Открыть")
+        self.open_case_button.clicked.connect(self.open_case)
+
+        case_layout = QVBoxLayout()
+        case_layout.addWidget(QLabel("Случаи реанимации:"))
+        case_layout.addWidget(self.case_search)
+        case_layout.addWidget(self.case_list)
+        case_layout.addWidget(self.open_case_button)
+
+        # ================= Колонка "Карточка случая" =================
+
+        self.case_title = QLabel("Выберите случай")
+        self.case_title.setStyleSheet("font-weight: bold; font-size: 16px;")
+
+        form_container = QWidget()
+        form_layout = QVBoxLayout(form_container)
+
+        self.field_edits = {}
+
+        clinical_label = QLabel("Клиническая картина")
+        clinical_label.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 6px;")
+        form_layout.addWidget(clinical_label)
+
+        for key, label in db.EMERGENCY_FIELDS:
+            field_label = QLabel(label + ":")
+            field_label.setStyleSheet("font-weight: bold;")
+            text_edit = QTextEdit()
+            text_edit.setMinimumHeight(55)
+            self.field_edits[key] = text_edit
+            form_layout.addWidget(field_label)
+            form_layout.addWidget(text_edit)
+
+        protocol_label = QLabel("Протокол сердечно-лёгочной реанимации")
+        protocol_label.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 12px;")
+        form_layout.addWidget(protocol_label)
+
+        for key, label in db.REANIMATION_FIELDS:
+            field_label = QLabel(label + ":")
+            field_label.setStyleSheet("font-weight: bold;")
+            text_edit = QTextEdit()
+            text_edit.setMinimumHeight(55)
+            self.field_edits[key] = text_edit
+            form_layout.addWidget(field_label)
+            form_layout.addWidget(text_edit)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(form_container)
+
+        self.preview_button = QPushButton("Предпросмотр")
+        self.preview_button.clicked.connect(self.preview_document)
+
+        self.print_button = QPushButton("Печать")
+        self.print_button.clicked.connect(self.print_document)
+
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.preview_button)
+        buttons_layout.addWidget(self.print_button)
+
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(self.case_title)
+        right_layout.addWidget(scroll)
+        right_layout.addLayout(buttons_layout)
+
+        # ================= Общая разметка =================
+
+        content = QHBoxLayout()
+        content.addLayout(case_layout, 1)
+        content.addLayout(right_layout, 2)
+
+        self.setLayout(content)
+
+    def load_cases(self):
+        db.create_tables()
+        self.cases = db.get_reanimation_cases()
+        self.populate_case_list(self.cases)
+
+    def populate_case_list(self, cases):
+        self.case_list.clear()
+        for case_id, name, mkb_code in cases:
+            label = f"{name} ({mkb_code})" if mkb_code else name
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, case_id)
+            self.case_list.addItem(item)
+
+    def filter_cases(self, text):
+        text = text.lower().strip()
+        if not text:
+            self.populate_case_list(self.cases)
+            return
+        filtered = [
+            c for c in self.cases
+            if text in c[1].lower() or text in (c[2] or "").lower()
+        ]
+        self.populate_case_list(filtered)
+
+    def open_case(self):
+
+        selected = self.case_list.currentItem()
+
+        if not selected:
+            QMessageBox.warning(self, "PatientNote", "Выберите случай из списка.")
+            return
+
+        case_id = selected.data(Qt.UserRole)
+        record = db.get_reanimation_case(case_id)
+
+        if record is None:
+            return
+
+        name, mkb_code, fields = record
+
+        self.current_case_id = case_id
+        self.current_case_name = name
+        self.current_mkb_code = mkb_code
+
+        title = f"{name} — код по МКБ: {mkb_code}" if mkb_code else name
+        self.case_title.setText(title)
+
+        for key, text_edit in self.field_edits.items():
+            text_edit.setPlainText(fields.get(key, ""))
+
+    def build_document(self):
+
+        diagnosis_display = self.current_case_name or "—"
+        if self.current_mkb_code:
+            diagnosis_display += f" (код по МКБ: {self.current_mkb_code})"
+
+        html = f"<p><b>Случай:</b> {diagnosis_display}</p>"
+
+        html += "<h2>Клиническая картина</h2>"
+        for key, label in db.EMERGENCY_FIELDS:
+            value = self.field_edits[key].toPlainText() or "—"
+            html += f"<h3>{label}</h3><p>{value.replace(chr(10), '<br>')}</p>"
+
+        html += "<h2>Протокол сердечно-лёгочной реанимации</h2>"
+        for key, label in db.REANIMATION_FIELDS:
+            value = self.field_edits[key].toPlainText() or "—"
+            html += f"<h3>{label}</h3><p>{value.replace(chr(10), '<br>')}</p>"
+
+        document = QTextDocument()
+        document.setHtml(html)
+        return document
+
+    def open_editable_note(self, document):
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Случай реанимации — можно отредактировать перед печатью")
+        dialog.resize(700, 800)
+
+        text_edit = QTextEdit(dialog)
+        text_edit.setDocument(document)
+
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Текст можно свободно менять — правки попадут в печать."))
+        layout.addWidget(text_edit)
+
+        buttons_row = QHBoxLayout()
+        print_button = QPushButton("Печать")
+        close_button = QPushButton("Закрыть")
+        buttons_row.addWidget(print_button)
+        buttons_row.addWidget(close_button)
+        layout.addLayout(buttons_row)
+
+        def do_print():
+            printer = QPrinter(QPrinter.HighResolution)
+            print_dialog = QPrintDialog(printer, dialog)
+            if print_dialog.exec() == QPrintDialog.Accepted:
+                text_edit.document().print_(printer)
+
+        print_button.clicked.connect(do_print)
+        close_button.clicked.connect(dialog.close)
+
+        dialog.exec()
+
+    def preview_document(self):
+        if not self.current_case_id:
+            QMessageBox.warning(self, "PatientNote", "Сначала откройте случай.")
+            return
+        self.open_editable_note(self.build_document())
+
+    def print_document(self):
+        if not self.current_case_id:
+            QMessageBox.warning(self, "PatientNote", "Сначала откройте случай.")
+            return
+        self.open_editable_note(self.build_document())
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self):
@@ -488,7 +708,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PatientNote — Карта СМП")
         self.resize(1300, 700)
 
-        self.setCentralWidget(EmergencyCardTab())
+        tabs = QTabWidget()
+        tabs.addTab(EmergencyCardTab(), "Карта СМП")
+        tabs.addTab(ReanimationTab(), "Реанимация")
+
+        self.setCentralWidget(tabs)
 
 
 if __name__ == "__main__":

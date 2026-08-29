@@ -1,8 +1,44 @@
 import sqlite3
+import sys
+import os
+import shutil
 from datetime import datetime
 
 
-DB_NAME = "patientnote.db"
+def _resolve_db_path():
+    """Определяет путь к рабочей базе данных.
+
+    В обычном запуске (python main.py) — файл рядом со скриптом, как раньше.
+
+    В собранном .exe (PyInstaller) вшитые файлы распаковываются во
+    временную папку, которая удаляется при закрытии программы — поэтому
+    БД оттуда копируется один раз при первом запуске в постоянную папку
+    (%APPDATA%\\PatientNoteSMP на Windows, ~/.patientnote_smp на прочих
+    системах), и дальше приложение работает уже с этой постоянной копией."""
+
+    if getattr(sys, "frozen", False):
+        # Папка, куда PyInstaller распаковал вшитые файлы (--add-data)
+        bundled_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        bundled_db = os.path.join(bundled_dir, "patientnote.db")
+
+        if sys.platform == "win32":
+            base_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PatientNoteSMP")
+        else:
+            base_dir = os.path.join(os.path.expanduser("~"), ".patientnote_smp")
+
+        os.makedirs(base_dir, exist_ok=True)
+        persistent_db = os.path.join(base_dir, "patientnote.db")
+
+        if not os.path.exists(persistent_db) and os.path.exists(bundled_db):
+            shutil.copyfile(bundled_db, persistent_db)
+
+        return persistent_db
+
+    # Обычный запуск из исходников — поведение как раньше
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "patientnote.db")
+
+
+DB_NAME = _resolve_db_path()
 
 
 # Разделы карты вызова СМП. key — имя столбца в БД, label — заголовок,
@@ -26,6 +62,30 @@ EMERGENCY_FIELDS = [
 EMERGENCY_FIELD_KEYS = [key for key, _label in EMERGENCY_FIELDS]
 
 EMERGENCY_FIELDS_DDL = ",\n        ".join(f"{key} TEXT" for key in EMERGENCY_FIELD_KEYS)
+
+
+# Поля протокола сердечно-лёгочной реанимации (вкладка «Реанимация»).
+# Случай реанимации хранит и обычные поля карты вызова (EMERGENCY_FIELDS —
+# жалобы/анамнез/объективно и т.д., для клинической картины), и вот эти
+# доп. поля, специфичные для протокола СЛР.
+REANIMATION_FIELDS = [
+    ("resuscitation_before_ems", "Реанимация до СМП"),
+    ("clinical_death_onset", "Наступление клинической смерти"),
+    ("airway_management", "Обеспечение проходимости ВДП"),
+    ("ventilation", "ИВЛ (ручная / аппаратная)"),
+    ("vascular_access", "Сосудистый доступ"),
+    ("chronometry", "Хронометраж реанимационных мероприятий"),
+    ("ecg_monitoring", "Электрокардиомониторинг и дефибрилляция"),
+    ("medication_support", "Медикаментозная поддержка"),
+    ("additional_manipulations", "Дополнительные манипуляции, действия, особые условия"),
+    ("resuscitation_outcome", "Итог реанимационных мероприятий"),
+]
+
+REANIMATION_FIELD_KEYS = [key for key, _label in REANIMATION_FIELDS]
+
+REANIMATION_FIELDS_DDL = ",\n        ".join(f"{key} TEXT" for key in REANIMATION_FIELD_KEYS)
+
+REANIMATION_ALL_FIELD_KEYS = EMERGENCY_FIELD_KEYS + REANIMATION_FIELD_KEYS
 
 
 def connect():
@@ -131,6 +191,22 @@ def create_tables():
         created_at TEXT,
         FOREIGN KEY(patient_id)
         REFERENCES patients(id)
+    )
+    """)
+
+    # ---------- Реанимация ----------
+
+    # Случаи реанимации: обычные поля карты вызова (клиническая картина)
+    # + доп. поля протокола сердечно-лёгочной реанимации.
+    reanimation_ddl = ",\n        ".join(
+        f"{key} TEXT" for key in REANIMATION_ALL_FIELD_KEYS
+    )
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS reanimation_cases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        mkb_code TEXT,
+        {reanimation_ddl}
     )
     """)
 
@@ -699,6 +775,100 @@ def delete_emergency_card(card_id):
     cursor = conn.cursor()
 
     cursor.execute("DELETE FROM emergency_cards WHERE id=?", (card_id,))
+
+    conn.commit()
+    conn.close()
+
+
+# ---------- Случаи реанимации ----------
+
+def add_reanimation_case(name, mkb_code, fields):
+    """Создаёт случай реанимации. fields — словарь
+    {field_key: text} по всем REANIMATION_ALL_FIELD_KEYS
+    (обычные поля карты + поля протокола СЛР)."""
+
+    conn = connect()
+    cursor = conn.cursor()
+
+    columns = ", ".join(REANIMATION_ALL_FIELD_KEYS)
+    placeholders = ", ".join("?" for _ in REANIMATION_ALL_FIELD_KEYS)
+    values = [fields.get(key, "") for key in REANIMATION_ALL_FIELD_KEYS]
+
+    cursor.execute(
+        f"""
+        INSERT INTO reanimation_cases(name, mkb_code, {columns})
+        VALUES (?, ?, {placeholders})
+        """,
+        (name, mkb_code, *values)
+    )
+
+    case_id = cursor.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    return case_id
+
+
+def get_reanimation_cases():
+
+    conn = connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT id, name, mkb_code
+        FROM reanimation_cases
+        ORDER BY id
+        """
+    )
+
+    result = cursor.fetchall()
+
+    conn.close()
+
+    return result
+
+
+def get_reanimation_case(case_id):
+    """Возвращает (name, mkb_code, fields) — fields это словарь
+    {field_key: text} по всем REANIMATION_ALL_FIELD_KEYS."""
+
+    conn = connect()
+    cursor = conn.cursor()
+
+    columns = ", ".join(REANIMATION_ALL_FIELD_KEYS)
+
+    cursor.execute(
+        f"""
+        SELECT name, mkb_code, {columns}
+        FROM reanimation_cases
+        WHERE id=?
+        """,
+        (case_id,)
+    )
+
+    row = cursor.fetchone()
+
+    conn.close()
+
+    if row is None:
+        return None
+
+    name, mkb_code = row[0], row[1]
+    field_values = row[2:2 + len(REANIMATION_ALL_FIELD_KEYS)]
+
+    fields = {key: (value or "") for key, value in zip(REANIMATION_ALL_FIELD_KEYS, field_values)}
+
+    return name, mkb_code, fields
+
+
+def delete_reanimation_case(case_id):
+
+    conn = connect()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM reanimation_cases WHERE id=?", (case_id,))
 
     conn.commit()
     conn.close()
