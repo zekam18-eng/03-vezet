@@ -10,6 +10,7 @@
   var LS_HISTORY = "patientnote_smp_history_v1";
   var LS_REANIMATION = "pn_local_reanimation_v1";
   var LS_LOCAL_STATUS = "pn_local_status_v1";
+  var LS_EMERGENCY = "pn_local_emergency_v1";
 
   var state = {
     data: null,
@@ -18,6 +19,7 @@
     view: "list", // "list" | "detail" | "history"
     currentItem: null,
     gridColCount: 35,
+    detailMode: "edit", // "edit" | "full" — только для emergency
   };
 
   var el = {
@@ -34,6 +36,8 @@
     detailTitle: document.getElementById("detailTitle"),
     detailMkb: document.getElementById("detailMkb"),
     detailFields: document.getElementById("detailFields"),
+    detailFullView: document.getElementById("detailFullView"),
+    fullViewBtn: document.getElementById("fullViewBtn"),
     backBtn: document.getElementById("backBtn"),
     historyBackBtn: document.getElementById("historyBackBtn"),
     copyBtn: document.getElementById("copyBtn"),
@@ -102,6 +106,20 @@
 
   // ---------------- Merged lists (base data + local overlay) ----------------
 
+  function getEmergencyList() {
+    var overrides = loadMap(LS_EMERGENCY);
+    var base = (state.data.emergency || []).map(function (item) {
+      var ov = overrides[String(item.id)];
+      return ov ? Object.assign({}, item, ov, { id: item.id }) : item;
+    });
+    var baseIds = {};
+    base.forEach(function (it) { baseIds[String(it.id)] = true; });
+    var extra = Object.keys(overrides)
+      .filter(function (k) { return !baseIds[k]; })
+      .map(function (k) { return overrides[k]; });
+    return base.concat(extra);
+  }
+
   function getReanimationList() {
     var overrides = loadMap(LS_REANIMATION);
     var base = (state.data.reanimation || []).map(function (item) {
@@ -132,7 +150,7 @@
 
   function currentDataset() {
     if (!state.data) return [];
-    if (state.activeTab === "emergency") return state.data.emergency;
+    if (state.activeTab === "emergency") return getEmergencyList();
     if (state.activeTab === "reanimation") return getReanimationList();
     if (state.activeTab === "localStatus") return getLocalStatusList();
     return [];
@@ -150,7 +168,7 @@
     el.topbarTitle.textContent = TAB_TITLES[state.activeTab];
 
     var isLookup = state.activeTab === "lookup";
-    el.addBtn.classList.toggle("hidden", isLookup || state.activeTab === "emergency");
+    el.addBtn.classList.toggle("hidden", isLookup);
     el.historyBtn.classList.toggle("hidden", state.activeTab !== "emergency");
     el.searchRow.classList.toggle("hidden", isLookup);
 
@@ -211,9 +229,33 @@
   // ---------------- Add new item ----------------
 
   el.addBtn.addEventListener("click", function () {
+    if (state.activeTab === "emergency") addEmergencyCase();
     if (state.activeTab === "reanimation") addReanimationCase();
     if (state.activeTab === "localStatus") addLocalStatusCase();
   });
+
+  function addEmergencyCase() {
+    var name = window.prompt("Название диагноза:");
+    if (name === null) return;
+    name = name.trim();
+    if (!name) { showToast("Введите название"); return; }
+    var mkb = window.prompt("Код по МКБ (можно оставить пустым):") || "";
+    mkb = mkb.trim();
+
+    var id = "local_" + Date.now();
+    var fields = {};
+    state.data.emergencyFields.forEach(function (pair) { fields[pair[0]] = ""; });
+    var newItem = { id: id, name: name, mkb: mkb, fields: fields };
+
+    var overrides = loadMap(LS_EMERGENCY);
+    overrides[id] = newItem;
+    saveMap(LS_EMERGENCY, overrides);
+
+    state.searchQuery = "";
+    el.searchInput.value = "";
+    renderList();
+    openDetail(newItem);
+  }
 
   function addReanimationCase() {
     var name = window.prompt("Название/диагноз случая:");
@@ -288,20 +330,29 @@
   function openDetail(item) {
     state.currentItem = item;
     state.view = "detail";
+    state.detailMode = "edit";
 
     el.detailTitle.textContent = item.name;
     el.detailMkb.textContent = item.mkb || "";
     el.detailMkb.style.display = item.mkb ? "" : "none";
 
+    el.detailFields.classList.remove("hidden");
+    el.detailFullView.classList.add("hidden");
+
     if (state.activeTab === "emergency") {
       renderEmergencyDetail(item);
-      el.saveBtn.textContent = "Сохранить в историю";
+      var isCustom = String(item.id).indexOf("local_") === 0;
+      el.saveBtn.textContent = isCustom ? "Сохранить" : "Сохранить в историю";
+      el.fullViewBtn.classList.remove("hidden");
+      el.fullViewBtn.textContent = "Просмотр целиком";
     } else if (state.activeTab === "reanimation") {
       renderReanimationDetail(item);
       el.saveBtn.textContent = "Сохранить случай";
+      el.fullViewBtn.classList.add("hidden");
     } else if (state.activeTab === "localStatus") {
       renderLocalStatusDetail(item);
       el.saveBtn.textContent = "Сохранить";
+      el.fullViewBtn.classList.add("hidden");
     }
 
     el.listView.classList.add("hidden");
@@ -345,6 +396,38 @@
       fields[ta.getAttribute("data-key")] = ta.value;
     });
     return fields;
+  }
+
+  // ---------------- Full view (просмотр целиком, только для "Карта СМП") ----------------
+
+  el.fullViewBtn.addEventListener("click", function () {
+    if (state.detailMode === "edit") {
+      renderFullView();
+      state.detailMode = "full";
+      el.detailFields.classList.add("hidden");
+      el.detailFullView.classList.remove("hidden");
+      el.fullViewBtn.textContent = "Редактировать";
+      window.scrollTo(0, 0);
+    } else {
+      state.detailMode = "edit";
+      el.detailFullView.classList.add("hidden");
+      el.detailFields.classList.remove("hidden");
+      el.fullViewBtn.textContent = "Просмотр целиком";
+    }
+  });
+
+  function renderFullView() {
+    var fields = collectEmergencyFields();
+    var html = "";
+    state.data.emergencyFields.forEach(function (pair) {
+      var label = pair[1];
+      var value = (fields[pair[0]] || "").trim();
+      html += "<h3>" + escapeHtml(label) + "</h3>";
+      html += value
+        ? "<p>" + escapeHtml(value) + "</p>"
+        : '<p class="empty-value">—</p>';
+    });
+    el.detailFullView.innerHTML = html;
   }
 
   // ---------------- Local status detail ----------------
@@ -537,6 +620,22 @@
   function saveEmergencyToHistory() {
     var item = state.currentItem;
     var fields = collectEmergencyFields();
+    var isCustom = String(item.id).indexOf("local_") === 0;
+
+    if (isCustom) {
+      // Диагноз, добавленный вручную — сохраняем прямо в него (без
+      // истории), чтобы при следующем открытии данные были на месте.
+      var overrides = loadMap(LS_EMERGENCY);
+      overrides[String(item.id)] = { id: item.id, name: item.name, mkb: item.mkb, fields: fields };
+      var okCustom = saveMap(LS_EMERGENCY, overrides);
+      if (okCustom) {
+        showToast("Сохранено");
+        if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+      } else {
+        showToast("Не удалось сохранить — нет места в хранилище");
+      }
+      return;
+    }
 
     var entry = {
       historyId: "h_" + Date.now(),
